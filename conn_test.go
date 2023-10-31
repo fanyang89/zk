@@ -2,8 +2,12 @@ package zk
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"io/ioutil"
+	"log"
+	"net"
 	"sync"
 	"testing"
 	"time"
@@ -195,4 +199,189 @@ func TestNotifyWatches(t *testing.T) {
 			}
 		})
 	}
+}
+
+func clientHandler(t *testing.T, ctx context.Context, conn net.Conn) {
+	defer conn.Close()
+
+	expiredSession := int64(123456)
+	newSession := int64(654321)
+	_ = newSession
+
+	nBuf := make([]byte, 4)
+	_, err := io.ReadFull(conn, nBuf)
+	if err != nil {
+		t.Errorf("Read connect request length failed, %v", err)
+		return
+	}
+
+	buf := make([]byte, binary.BigEndian.Uint32(nBuf))
+	_, err = io.ReadFull(conn, buf)
+	if err != nil {
+		t.Errorf("Read connect request failed, %v", err)
+		return
+	}
+
+	var req connectRequest
+	_, err = decodePacket(buf, &req)
+	if err != nil {
+		t.Errorf("Decode connect request failed, %v", err)
+		return
+	}
+	log.Println("Receive connect request")
+
+	buf = make([]byte, 256)
+	var rsp connectResponse
+	rsp.ProtocolVersion = 0
+	if req.SessionID == expiredSession {
+		rsp.SessionID = 0
+		rsp.TimeOut = 0
+		rsp.Passwd = make([]byte, 16)
+	} else {
+		return
+		//rsp.SessionID = newSession
+		//rsp.TimeOut = 2000
+		//rsp.Passwd = []byte("deadbeefdeadbeef")
+	}
+
+	n, err := encodePacket(buf[4:], &rsp)
+	if err != nil {
+		t.Errorf("Encode connect response failed, %v", err)
+		return
+	}
+	binary.BigEndian.PutUint32(buf[:4], uint32(n))
+
+	_, err = conn.Write(buf[:4])
+	if err != nil {
+		t.Errorf("Send connect response length failed, %v", err)
+		return
+	}
+
+	_, err = conn.Write(buf[4:])
+	if err != nil {
+		t.Errorf("Send connect response failed, %v", err)
+		return
+	}
+	log.Println("Connect response sent")
+
+	// handle ping request
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		nBuf = make([]byte, 4)
+		_, err = conn.Read(nBuf)
+		if err != nil {
+			t.Errorf("Read ping request length failed, %v", err)
+			return
+		}
+
+		buf = make([]byte, binary.BigEndian.Uint32(nBuf))
+		_, err = io.ReadFull(conn, buf)
+		if err != nil {
+			t.Errorf("Read ping request failed, %v", err)
+			return
+		}
+
+		rsp := make([]byte, 32)
+		n, err := encodePacket(rsp[4:], &responseHeader{Xid: -2, Zxid: 0x1, Err: 0})
+		if err != nil {
+			t.Errorf("Encode ping response failed, %v", err)
+			return
+		}
+		binary.BigEndian.PutUint32(buf[:4], uint32(n))
+
+		_, err = conn.Write(rsp)
+		if err != nil {
+			t.Errorf("Send ping response failed, %v", err)
+		}
+	}
+}
+
+func TestSessionExpired(t *testing.T) {
+	// run mock server
+	a := make(chan net.Addr)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func(ctx context.Context) {
+		ln, err := net.Listen("tcp", ":0")
+		if err != nil {
+			t.Errorf("listen failed, %v", err)
+			return
+		}
+		a <- ln.Addr()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			conn, err := ln.Accept()
+			if err != nil {
+				t.Errorf("accept failed, %v", err)
+				return
+			}
+			log.Printf("Accept client: %v", conn.RemoteAddr())
+
+			go clientHandler(t, ctx, conn)
+		}
+	}(ctx)
+
+	serverSock := <-a
+
+	c := &Conn{
+		dialer: func(network, address string, timeout time.Duration) (net.Conn, error) {
+			return net.Dial(serverSock.Network(), serverSock.String())
+		},
+		shouldQuit:     make(chan struct{}),
+		connectTimeout: time.Second,
+		recvTimeout:    2 * time.Second,
+		sendChan:       make(chan *request, sendChanSize),
+		logger:         DefaultLogger,
+		hostProvider:   &EmptyHostProvider{},
+		sessionID:      123456,
+		resendZkAuthFn: resendZkAuth,
+		buf:            make([]byte, bufferSize),
+	}
+	_ = c.hostProvider.Init([]string{"127.0.0.1:2181", "127.0.0.1:2182", "127.0.0.1:2183"})
+
+	c.loop(context.Background())
+}
+
+type EmptyHostProvider struct {
+	idx     int
+	servers []string
+}
+
+func (e *EmptyHostProvider) Init(servers []string) error {
+	e.idx = 0
+	e.servers = servers
+	return nil
+}
+
+func (e *EmptyHostProvider) Len() int {
+	return len(e.servers)
+}
+
+func (e *EmptyHostProvider) Connected() {
+	log.Printf("Connected to %v", e.idx)
+}
+
+func (e *EmptyHostProvider) Next() (server string, retryStart bool) {
+	if e.idx >= len(e.servers) {
+		retryStart = true
+		e.idx = 0
+	}
+
+	server = e.servers[e.idx]
+	e.idx++
+
+	log.Printf("Next server is %v", server)
+	return
 }
